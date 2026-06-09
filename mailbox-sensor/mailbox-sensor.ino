@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "secrets.h"
 
@@ -12,45 +13,119 @@ const int reedPin = D2;
 
 int previousState = HIGH;
 
+unsigned long lastNotifyAt = 0;
+const unsigned long notifyCooldownMs = 10000;
+
 /**
  * @brief Wi-Fiへ接続する
+ *
+ * 接続が不安定な場合に備えて、状態とRSSIをログ出力する。
+ *
+ * @return true 接続成功
+ * @return false 接続失敗
  */
-void connectWiFi() {
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(true);
+  delay(1000);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print("Connecting to WiFi");
 
+  const unsigned long timeoutMs = 30000;
+  const unsigned long startedAt = millis();
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+
+    if (millis() - startedAt > timeoutMs) {
+      Serial.println();
+      Serial.print("WiFi timeout. status=");
+      Serial.println(WiFi.status());
+      return false;
+    }
   }
 
   Serial.println();
   Serial.println("WiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("RSSI: ");
+  Serial.println(WiFi.RSSI());
+
+  delay(1000);
+  return true;
 }
 
 /**
  * @brief Discord Webhookへメッセージを送信する
  *
+ * HTTPS接続はESP32環境だとたまに失敗するため、最大3回リトライする。
+ *
  * @param message Discordに送る本文
+ * @return true 送信成功
+ * @return false 送信失敗
+ *
+ * @example
+ * bool ok = sendDiscordMessage("📬 郵便受けが開きました");
  */
-void sendDiscordMessage(const String& message) {
+bool sendDiscordMessage(const String& message) {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
 
-  HTTPClient http;
-  http.begin(DISCORD_WEBHOOK_URL);
-  http.addHeader("Content-Type", "application/json");
+  const int maxRetries = 5;
 
-  String payload = "{\"content\":\"" + message + "\"}";
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000);
 
-  int httpCode = http.POST(payload);
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.setReuse(false);
 
-  Serial.print("Discord response: ");
-  Serial.println(httpCode);
+    Serial.printf("Discord attempt: %d\n", attempt);
 
-  http.end();
+    if (!http.begin(client, DISCORD_WEBHOOK_URL)) {
+      Serial.println("HTTP begin failed");
+      http.end();
+      delay(1000);
+      continue;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"content\":\"" + message + "\"}";
+    int httpCode = http.POST(payload);
+
+    Serial.printf("HTTP Code: %d\n", httpCode);
+
+    if (httpCode == 204) {
+      Serial.println("Discord success");
+      http.end();
+      return true;
+    }
+
+    if (httpCode <= 0) {
+      Serial.printf(
+        "HTTP Error: %s\n",
+        http.errorToString(httpCode).c_str()
+      );
+    } else {
+      Serial.printf("Discord HTTP error: %d\n", httpCode);
+    }
+
+    http.end();
+
+    delay(1000);
+  }
+
+  Serial.println("Discord failed after retries");
+  return false;
 }
 
 void setup() {
@@ -74,7 +149,14 @@ void loop() {
       Serial.println("CLOSED");
     } else {
       Serial.println("OPEN");
-      sendDiscordMessage("📬 郵便受けが開きました");
+
+      if (millis() - lastNotifyAt > notifyCooldownMs) {
+        bool ok = sendDiscordMessage("📬 郵便受けが開きました");
+
+        if (ok) {
+          lastNotifyAt = millis();
+        }
+      }
     }
 
     previousState = currentState;
