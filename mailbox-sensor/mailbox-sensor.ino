@@ -12,8 +12,6 @@
  */
 const int reedPin = D2;
 
-int previousState = HIGH;
-
 unsigned long lastNotifyAt = 0;
 const unsigned long notifyCooldownMs = 10000;
 
